@@ -1,9 +1,9 @@
 # -*- coding: utf-8 -*-
 """
-Laplateforme.com Product Scraper
+Laplateforme.com Resume Scraper
 
-Sequential, stable scraper with real-time CSV updates and comprehensive logging.
-Handles JavaScript rendering, pagination, and cross-category deduplication.
+Intelligently collects missed products by checking all categories while deduplicating
+against existing data. Preserves progress on interruption.
 """
 
 import asyncio
@@ -21,9 +21,12 @@ import io
 sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding='utf-8')
 
 
-class LaplatefFormeStableScraper:
-    def __init__(self, output_dir="output/laplateforme"):
+class MissedProductsScraper:
+    def __init__(self, output_dir="output/laplateforme_missed_elements", existing_dir="output/laplateforme", start_category=1):
         self.output_dir = Path(output_dir)
+        self.existing_dir = Path(existing_dir)
+        self.start_category = start_category
+        
         self.pdf_dir = self.output_dir / "pdf"
         self.data_dir = self.output_dir / "data" / "json"
         
@@ -33,21 +36,69 @@ class LaplatefFormeStableScraper:
         
         self.products = []
         self.product_ids = set()
-        self.product_first_category = {}  # Track where product was first found
+        self.existing_product_ids = set()  # IDs from first scraping run
+        self.product_first_category = {}
         self.errors = []
         self.duplicates_in_category = 0
+        self.skipped_existing = 0  # Count products skipped because they exist
         
         self.csv_file = self.output_dir / "products.csv"
         self.errors_file = self.output_dir / "errors.csv"
         self.log_file = self.output_dir / "scraping.log"
         
         self.start_time = None
-        self.estimated_total = 20000  # Rough estimate for laplateforme
+        self.estimated_total = 5000  # Remaining categories
         self.category_start_time = None
         self.products_at_category_start = 0
         
+        # Load existing product IDs
+        self._load_existing_product_ids()
+        
+        # Load already scraped products from current run (to preserve progress)
+        self._load_current_progress()
+    
+    def _load_existing_product_ids(self):
+        """Load product IDs from existing laplateforme scraping"""
+        existing_csv = self.existing_dir / "products.csv"
+        
+        if existing_csv.exists():
+            try:
+                with open(existing_csv, 'r', encoding='utf-8') as f:
+                    reader = csv.DictReader(f, delimiter=';')
+                    for row in reader:
+                        product_id = row.get('product_id', '')
+                        if product_id:
+                            self.existing_product_ids.add(product_id)
+                
+                print(f"✓ Loaded {len(self.existing_product_ids)} existing product IDs from {existing_csv}")
+                print(f"  These products will be skipped during scraping\n")
+            except Exception as e:
+                print(f"⚠️ Could not load existing products: {e}")
+                print(f"  Continuing without deduplication...\n")
+    
+    def _load_current_progress(self):
+        """Load already scraped products from current run to preserve progress"""
+        current_csv = self.csv_file
+        
+        if current_csv.exists():
+            try:
+                with open(current_csv, 'r', encoding='utf-8') as f:
+                    reader = csv.DictReader(f, delimiter=';')
+                    for row in reader:
+                        product_id = row.get('product_id', '')
+                        if product_id:
+                            self.products.append(row)
+                            self.product_ids.add(product_id)
+                            # Also add to existing IDs so we don't scrape it again
+                            self.existing_product_ids.add(product_id)
+                
+                print(f"✓ Loaded {len(self.products)} products from previous run")
+                print(f"  Progress preserved, continuing from where we left off\n")
+            except Exception as e:
+                print(f"⚠️ Could not load previous progress: {e}\n")
+    
     def log(self, msg):
-        """Log message to console and file with timestamp"""
+        """Log with FORCED flush"""
         timestamp = datetime.now().strftime("%H:%M:%S")
         log_msg = f"[{timestamp}] {msg}"
         print(log_msg, flush=True)
@@ -62,11 +113,11 @@ class LaplatefFormeStableScraper:
             return "", ""
         
         elapsed = (datetime.now() - self.start_time).total_seconds()
-        if elapsed < 10:  # Too early
+        if elapsed < 10:
             return "", ""
         
         products_count = len(self.products)
-        speed = products_count / elapsed * 60  # products per minute
+        speed = products_count / elapsed * 60
         
         remaining = self.estimated_total - products_count
         if speed > 0 and remaining > 0:
@@ -82,7 +133,7 @@ class LaplatefFormeStableScraper:
         return f"{speed:.1f}/min", eta_str
     
     async def scrape_product(self, page, product_url):
-        """Scrape single product - FAST"""
+        """Scrape single product"""
         try:
             # Extract ID
             match = re.search(r'/catalogue/produit/(\d+)', product_url)
@@ -107,9 +158,7 @@ class LaplatefFormeStableScraper:
                 if isinstance(item, dict):
                     product_data.update(item)
             
-            # Format prices with comma as decimal separator for Excel
-            
-            # Price 1: ecommerce.value (main price shown on site)
+            # Format prices
             ecommerce_data = product_data.get('ecommerce', {})
             raw_price_main = ecommerce_data.get('value', product_data.get('price', ''))
             if raw_price_main:
@@ -121,7 +170,6 @@ class LaplatefFormeStableScraper:
             else:
                 formatted_price_main = ''
             
-            # Price 2: product_unitprice_ht (may differ from main price)
             raw_price_ht = product_data.get('product_unitprice_ht', '')
             if raw_price_ht:
                 try:
@@ -163,7 +211,7 @@ class LaplatefFormeStableScraper:
             raise Exception(str(e)[:100])
     
     async def download_pdf(self, pdf_url, pdf_path):
-        """Download PDF - FAST"""
+        """Download PDF"""
         try:
             async with aiohttp.ClientSession() as session:
                 async with session.get(pdf_url, timeout=aiohttp.ClientTimeout(total=10)) as response:
@@ -178,20 +226,19 @@ class LaplatefFormeStableScraper:
             return False
     
     def save_csv(self):
-        """Save CSV with SEMICOLON delimiter and COMMA decimal separator"""
+        """Save CSV"""
         if self.products:
-            # Try 3 times
             for attempt in range(3):
                 try:
                     with open(self.csv_file, 'w', newline='', encoding='utf-8') as f:
                         writer = csv.DictWriter(f, fieldnames=self.products[0].keys(), delimiter=';')
                         writer.writeheader()
                         writer.writerows(self.products)
-                    break  # Success!
+                    break
                 except PermissionError:
                     if attempt < 2:
                         import time
-                        time.sleep(0.5)  # Wait and retry
+                        time.sleep(0.5)
                     else:
                         self.log(f"    ⚠️ CSV locked (Excel open?), skipping save")
         
@@ -205,24 +252,26 @@ class LaplatefFormeStableScraper:
                     break
                 except PermissionError:
                     if attempt == 2:
-                        pass  # Skip silently
+                        pass
     
     async def scrape(self, limit=None):
-        """Main scraping - SEQUENTIAL & STABLE"""
+        """Main scraping - check ALL categories for missed products"""
         start_time = datetime.now()
+        self.start_time = start_time
+        
         self.log("="*80)
-        self.log("💎 LAPLATEFORME.COM STABLE SCRAPER 💎")
+        self.log("💎 LAPLATEFORME.COM - MISSED PRODUCTS SCRAPER 💎")
         self.log("="*80)
         self.log(f"Output: {self.output_dir}")
+        self.log(f"Existing products loaded: {len(self.existing_product_ids)}")
+        self.log(f"Already scraped (current run): {len(self.products)}")
         if limit:
             self.log(f"Limit: {limit} products")
-        self.log("\nMode: Sequential (stable, CSV always synced)")
+        self.log("\nMode: Sequential (ALL categories, with deduplication)")
         self.log("")
         
         async with async_playwright() as p:
-            # Use larger viewport to load all products (Angular.js adapts to screen size)
             browser = await p.chromium.launch(headless=True)
-            # Set viewport size to match full screen browser
             context = await browser.new_context(viewport={'width': 1920, 'height': 1080})
             
             # Get categories
@@ -242,7 +291,9 @@ class LaplatefFormeStableScraper:
                         categories.append(href)
                 
                 categories = list(set(categories))
-                self.log(f"Found {len(categories)} categories\n")
+                total_categories = len(categories)
+                self.log(f"Found {total_categories} categories to check\n")
+                    
             finally:
                 await finder_page.close()
             
@@ -257,13 +308,14 @@ class LaplatefFormeStableScraper:
                         break
                     
                     self.log(f"{'='*80}")
-                    self.log(f"[Category {cat_i}/{len(categories)}]")
-                    self.log(f"{cat_url}")  # FULL URL!
+                    self.log(f"[Category {cat_i}/{total_categories}]")
+                    self.log(f"{cat_url}")
                     self.log(f"{'='*80}")
                     
                     # Track category time
                     self.category_start_time = datetime.now()
                     self.products_at_category_start = len(self.products)
+                    skipped_at_start = self.skipped_existing
                     
                     # Find products
                     cat_product_urls = []
@@ -273,15 +325,16 @@ class LaplatefFormeStableScraper:
                         await product_finder.goto(cat_url, wait_until='domcontentloaded', timeout=12000)
                         await asyncio.sleep(1.0)
                         
-                        # Scroll down to load all lazy-loaded products
+                        # Scroll to load lazy products
                         await product_finder.evaluate('window.scrollTo(0, document.body.scrollHeight)')
-                        await asyncio.sleep(0.8)  # Wait for lazy loading
+                        await asyncio.sleep(0.8)
                         
                         page_num = 1
                         while True:
                             links = await product_finder.query_selector_all('a[href*="/catalogue/produit/"]')
                             new_products = 0
                             duplicates_on_page = 0
+                            skipped_on_page = 0
                             
                             for link in links:
                                 href = await link.get_attribute('href')
@@ -289,6 +342,14 @@ class LaplatefFormeStableScraper:
                                     match = re.search(r'/catalogue/produit/(\d+)', href)
                                     if match:
                                         product_id = match.group(1)
+                                        
+                                        # Check if exists in old scraping
+                                        if product_id in self.existing_product_ids:
+                                            self.skipped_existing += 1
+                                            skipped_on_page += 1
+                                            continue
+                                        
+                                        # Check if already in current run
                                         if product_id not in self.product_ids:
                                             if not href.startswith('http'):
                                                 href = 'https://www.laplateforme.com' + href
@@ -297,16 +358,16 @@ class LaplatefFormeStableScraper:
                                             self.product_first_category[product_id] = f"Cat {cat_i}: {cat_url[:60]}"
                                             new_products += 1
                                         else:
-                                            # Check if it's a cross-category duplicate (not just same-page link)
                                             first_cat_info = self.product_first_category.get(product_id, '')
                                             if first_cat_info and f"Cat {cat_i}:" not in first_cat_info:
-                                                # Log only cross-category duplicates
-                                                self.log(f"    ⚠️ DUP: [{product_id}] already from {first_cat_info}")
                                                 duplicates_on_page += 1
                                                 self.duplicates_in_category += 1
                             
-                            if new_products > 0:
-                                self.log(f"  Page {page_num}: +{new_products} products")
+                            if new_products > 0 or skipped_on_page > 0:
+                                msg = f"  Page {page_num}: +{new_products} new"
+                                if skipped_on_page > 0:
+                                    msg += f", skipped {skipped_on_page} existing"
+                                self.log(msg)
                             
                             # Next page
                             has_next = await product_finder.evaluate('''() => {
@@ -322,14 +383,16 @@ class LaplatefFormeStableScraper:
                                 except:
                                     pass
                                 await asyncio.sleep(0.8)
-                                # Scroll to load lazy-loaded products on new page
                                 await product_finder.evaluate('window.scrollTo(0, document.body.scrollHeight)')
                                 await asyncio.sleep(0.7)
                                 page_num += 1
                             else:
                                 break
                         
-                        self.log(f"  → Found {len(cat_product_urls)} products in {page_num} pages")
+                        skipped_in_cat = self.skipped_existing - skipped_at_start
+                        self.log(f"  → Found {len(cat_product_urls)} NEW products in {page_num} pages")
+                        if skipped_in_cat > 0:
+                            self.log(f"  → Skipped {skipped_in_cat} products (already in laplateforme)")
                         if self.duplicates_in_category > 0:
                             self.log(f"  → Skipped {self.duplicates_in_category} cross-category duplicates")
                         
@@ -338,10 +401,10 @@ class LaplatefFormeStableScraper:
                         continue
                     
                     if not cat_product_urls:
-                        self.log(f"  → Empty category, skipping\n")
+                        self.log(f"  → No new products in this category, skipping\n")
                         continue
                     
-                    # SCRAPE SEQUENTIALLY (one by one)
+                    # SCRAPE SEQUENTIALLY
                     self.log(f"  Scraping {len(cat_product_urls)} products...")
                     
                     for i, url in enumerate(cat_product_urls, 1):
@@ -361,7 +424,7 @@ class LaplatefFormeStableScraper:
                             
                             self.log(f"[{str(total).rjust(5)}] [{sku.ljust(6)}] {status_icon} {name_short} | {price_main} / {price_ht} | PDF: {status_icon}")
                             
-                            # SAVE AFTER EVERY PRODUCT!
+                            # Save after every product
                             self.save_csv()
                             
                         except Exception as e:
@@ -372,14 +435,14 @@ class LaplatefFormeStableScraper:
                             })
                             self.log(f"[{str(len(self.products)+1).rjust(5)}] ✗ ERROR: {str(e)[:60]}")
                     
-                    # Show stats after category
+                    # Category stats
                     cat_duration = (datetime.now() - self.category_start_time).total_seconds()
                     products_in_cat = len(self.products) - self.products_at_category_start
                     cat_speed = (products_in_cat / cat_duration * 60) if cat_duration > 0 else 0
                     
                     self.log(f"\n  ✓ Category done!")
                     self.log(f"    Category stats: {products_in_cat} products | {cat_duration:.0f}s | {cat_speed:.1f}/min")
-                    self.log(f"    Global total:   {len(self.products)} products | {len(self.errors)} errors")
+                    self.log(f"    Global total:   {len(self.products)} NEW products | {self.skipped_existing} skipped existing | {len(self.errors)} errors")
                     self.log("")
                     
             finally:
@@ -398,12 +461,13 @@ class LaplatefFormeStableScraper:
         self.log("\n" + "="*80)
         self.log("🎉 SCRAPING COMPLETE! 🎉")
         self.log("="*80)
-        self.log(f"Products scraped: {len(self.products)}")
-        self.log(f"Errors:          {len(self.errors)}")
-        self.log(f"Duration:        {duration:.0f}s ({duration/60:.1f}min / {duration/3600:.1f}h)")
-        self.log(f"Average speed:   {avg_speed:.1f} products/min")
+        self.log(f"NEW products scraped: {len(self.products)}")
+        self.log(f"Skipped (existing):   {self.skipped_existing}")
+        self.log(f"Errors:               {len(self.errors)}")
+        self.log(f"Duration:             {duration:.0f}s ({duration/60:.1f}min / {duration/3600:.1f}h)")
+        self.log(f"Average speed:        {avg_speed:.1f} products/min")
         
-        # Count actual files
+        # Count files
         pdf_count = len(list(self.pdf_dir.glob('*.pdf')))
         json_count = len(list(self.data_dir.glob('*.json')))
         
@@ -426,7 +490,11 @@ class LaplatefFormeStableScraper:
 
 
 async def main():
-    scraper = LaplatefFormeStableScraper()
+    scraper = MissedProductsScraper(
+        output_dir="output/laplateforme_missed_elements",
+        existing_dir="output/laplateforme",
+        start_category=1
+    )
     await scraper.scrape(limit=None)
 
 

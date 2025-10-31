@@ -12,8 +12,9 @@ High-performance asynchronous scraper that extracts product data, PDFs, and tech
 - **PDF Downloads**: Automatic technical specification sheet downloads
 - **Smart Deduplication**: Prevents duplicate products across categories
 - **Resume Capability**: Continue from where you left off after interruption
+- **Change Detection**: Detects new products, removed products, and price changes
 - **Structured Output**: CSV, JSON, and organized PDF storage
-- **Progress Tracking**: Real-time logging with speed metrics and ETAs
+- **Progress Tracking**: Real-time logging with unified format
 - **Error Handling**: Robust retry logic and error logging
 
 ## 🚀 Quick Start
@@ -56,7 +57,18 @@ python resume_missed_scraper.py
 The resume scraper automatically:
 - Loads existing product IDs to prevent duplicates
 - Continues from previous progress if interrupted
+- Checks ALL categories for missed products
 - Saves new products to separate directory
+
+**Check for Changes (new/removed products, price changes):**
+```bash
+python check_changes.py
+```
+
+The change detector:
+- Compares current catalog with existing data
+- Detects new products, removed products, and price changes
+- Saves changes to CSV file
 
 ## 📁 Output Structure
 
@@ -72,8 +84,11 @@ output/
 │   └── data/json/                   # Full product data
 │       ├── {product_id}.json
 │       └── ...
-└── laplateforme_missed_elements/    # Resume scraping results
-    └── (same structure as above)
+├── laplateforme_missed_elements/    # Resume scraping results
+│   └── (same structure as above)
+└── changes/                         # Change detection results
+    ├── changes.csv                  # Detected changes (NEW/REMOVED/PRICE_CHANGE)
+    └── changes.log                  # Detection log
 ```
 
 ## 📊 Output Format
@@ -100,16 +115,12 @@ Complete product data extracted from site's dataLayer, including all available m
 
 ## ⚙️ Configuration
 
-Edit `config.yaml` to customize:
+All configuration is hardcoded in the scripts for simplicity. Key settings:
 
-```yaml
-default_scraping:
-  parallel_workers: 50      # Sequential (set to 1 for reliability)
-  delay_between_requests: 0.1
-  max_retries: 3
-  timeout: 30
-  download_pdf: true
-```
+- **Timeout**: 5 seconds per product page (5000ms)
+- **PDF Downloads**: Enabled by default
+- **Processing**: Sequential (stable, reliable)
+- **Retries**: Automatic error handling with logging
 
 ## 🔧 Technical Details
 
@@ -125,24 +136,26 @@ default_scraping:
 - Main scraper for complete site crawling
 - Category discovery and pagination handling
 - Cross-category duplicate detection
+- Real-time CSV updates
 
 **resume_missed_scraper.py**
 - Intelligent resume functionality
+- Checks ALL categories for missed products
 - Deduplication against existing data
 - Progress preservation on interruption
 
-**Utilities (utils/)**
-- `deduplicator.py`: Product uniqueness validation
-- `csv_exporter.py`: CSV formatting and export
-- `logger.py`: Structured logging
-- `checkpoint.py`: Progress state management
+**check_changes.py**
+- Change detection system
+- Compares current catalog with existing data
+- Detects new products, removed products, price changes
+- Exports changes to CSV
 
 ## 📈 Performance
 
-- **Speed**: ~6-10 products/minute (sequential, stable)
+- **Speed**: ~15-20 products/minute (sequential, stable, ~3 seconds per product)
 - **Reliability**: Automatic retry on failures
 - **Memory**: Efficient streaming, no full dataset in memory
-- **Scale**: Handles 17,000+ products without issues
+- **Scale**: Handles 25,000+ products without issues
 
 ## 🛡️ Best Practices
 
@@ -165,6 +178,12 @@ python resume_missed_scraper.py
 
 # ... checks all categories, skips existing products ...
 # Results: New products in output/laplateforme_missed_elements/
+
+# Periodically check for changes
+python check_changes.py
+
+# ... compares current catalog with existing data ...
+# Results: changes.csv with NEW/REMOVED/PRICE_CHANGE products
 ```
 
 ## 🐛 Troubleshooting
@@ -173,7 +192,7 @@ python resume_missed_scraper.py
 
 **CSV locked**: Close Excel/LibreOffice before running scraper
 
-**Playwright timeout**: Increase `timeout` in config.yaml or check internet connection
+**Playwright timeout**: Increase timeout value in script (currently 5000ms) or check internet connection
 
 **Memory issues**: Script is optimized for low memory usage, but ensure 2GB+ RAM available
 

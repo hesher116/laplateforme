@@ -132,7 +132,7 @@ class MissedProductsScraper:
         
         return f"{speed:.1f}/min", eta_str
     
-    async def scrape_product(self, page, product_url):
+    async def scrape_product(self, page, product_url, category_name=''):
         """Scrape single product"""
         try:
             # Extract ID
@@ -158,6 +158,22 @@ class MissedProductsScraper:
                 if isinstance(item, dict):
                     product_data.update(item)
             
+            # Extract category from breadcrumbs if not provided
+            if not category_name:
+                try:
+                    breadcrumbs = await page.evaluate('''() => {
+                        const breadcrumbs = [];
+                        const items = document.querySelectorAll('.breadcrumb a, nav[aria-label*="breadcrumb"] a, ol.breadcrumb a');
+                        items.forEach(item => {
+                            if (item.textContent.trim()) breadcrumbs.push(item.textContent.trim());
+                        });
+                        return breadcrumbs;
+                    }''')
+                    if breadcrumbs and len(breadcrumbs) > 1:
+                        category_name = breadcrumbs[-1]  # Last breadcrumb is usually the category
+                except:
+                    pass
+            
             # Format prices
             ecommerce_data = product_data.get('ecommerce', {})
             raw_price_main = ecommerce_data.get('value', product_data.get('price', ''))
@@ -180,6 +196,9 @@ class MissedProductsScraper:
             else:
                 formatted_price_ht = ''
             
+            # Get category - prefer dataLayer, then breadcrumbs, then provided
+            category = product_data.get('product_category', '') or category_name or ''
+            
             # Build product
             product = {
                 'product_id': product_id,
@@ -189,7 +208,7 @@ class MissedProductsScraper:
                 'product_unitprice_ht': formatted_price_ht,
                 'brand': product_data.get('product_brand', ''),
                 'sku': product_data.get('product_sku', product_id),
-                'category': product_data.get('product_category', ''),
+                'category': category,
                 'pdf_url': f"https://www.laplateforme.com/catalogue/pdf/product/false/{product_id}",
                 'pdf_downloaded': 'no',
                 'status': 'success'
@@ -278,19 +297,37 @@ class MissedProductsScraper:
             self.log("Finding categories...")
             finder_page = await context.new_page()
             try:
-                await finder_page.goto('https://www.laplateforme.com/', wait_until='domcontentloaded', timeout=30000)
+                await finder_page.goto('https://www.laplateforme.com/', wait_until='networkidle', timeout=30000)
+                await asyncio.sleep(3)  # Wait for Angular.js to render
+                
+                # Scroll to load lazy content
+                await finder_page.evaluate('window.scrollTo(0, document.body.scrollHeight)')
+                await asyncio.sleep(1)
+                await finder_page.evaluate('window.scrollTo(0, 0)')
                 await asyncio.sleep(1)
                 
                 links = await finder_page.query_selector_all('a[href*="/catalogue/categorie/"]')
                 categories = []
                 for link in links:
                     href = await link.get_attribute('href')
-                    if href:
+                    if href and '/catalogue/categorie/' in href:
                         if not href.startswith('http'):
                             href = 'https://www.laplateforme.com' + href
                         categories.append(href)
                 
                 categories = list(set(categories))
+                if len(categories) == 0:
+                    self.log("⚠️ No categories found, trying alternative method...")
+                    await asyncio.sleep(3)
+                    links = await finder_page.query_selector_all('a[href*="/catalogue/categorie/"]')
+                    for link in links:
+                        href = await link.get_attribute('href')
+                        if href and '/catalogue/categorie/' in href:
+                            if not href.startswith('http'):
+                                href = 'https://www.laplateforme.com' + href
+                            categories.append(href)
+                    categories = list(set(categories))
+                
                 total_categories = len(categories)
                 self.log(f"Found {total_categories} categories to check\n")
                     
@@ -334,7 +371,8 @@ class MissedProductsScraper:
                             links = await product_finder.query_selector_all('a[href*="/catalogue/produit/"]')
                             new_products = 0
                             duplicates_on_page = 0
-                            skipped_on_page = 0
+                            skipped_on_page = set()  # Track unique skipped IDs per page
+                            seen_on_page = set()  # Track unique IDs found on this page
                             
                             for link in links:
                                 href = await link.get_attribute('href')
@@ -343,10 +381,15 @@ class MissedProductsScraper:
                                     if match:
                                         product_id = match.group(1)
                                         
+                                        # Skip if already processed on this page
+                                        if product_id in seen_on_page:
+                                            continue
+                                        seen_on_page.add(product_id)
+                                        
                                         # Check if exists in old scraping
                                         if product_id in self.existing_product_ids:
+                                            skipped_on_page.add(product_id)
                                             self.skipped_existing += 1
-                                            skipped_on_page += 1
                                             continue
                                         
                                         # Check if already in current run
@@ -363,10 +406,10 @@ class MissedProductsScraper:
                                                 duplicates_on_page += 1
                                                 self.duplicates_in_category += 1
                             
-                            if new_products > 0 or skipped_on_page > 0:
+                            if new_products > 0 or len(skipped_on_page) > 0:
                                 msg = f"  Page {page_num}: +{new_products} new"
-                                if skipped_on_page > 0:
-                                    msg += f", skipped {skipped_on_page} existing"
+                                if len(skipped_on_page) > 0:
+                                    msg += f", skipped {len(skipped_on_page)} existing"
                                 self.log(msg)
                             
                             # Next page
@@ -404,6 +447,27 @@ class MissedProductsScraper:
                         self.log(f"  → No new products in this category, skipping\n")
                         continue
                     
+                    # Extract category name from URL
+                    category_name = ''
+                    try:
+                        # Extract category name from URL path
+                        # URL format: /catalogue/categorie/category-path/ID
+                        url_parts = [p for p in cat_url.split('/') if p]
+                        if 'categorie' in url_parts:
+                            cat_idx = url_parts.index('categorie')
+                            if cat_idx + 1 < len(url_parts):
+                                # Get all parts after 'categorie' before the ID (last numeric part)
+                                cat_parts = []
+                                for part in url_parts[cat_idx + 1:]:
+                                    if part.isdigit():
+                                        break
+                                    cat_parts.append(part)
+                                if cat_parts:
+                                    # Use last meaningful part or join if multiple
+                                    category_name = cat_parts[-1].replace('-', ' ').title()
+                    except:
+                        pass
+                    
                     # SCRAPE SEQUENTIALLY
                     self.log(f"  Scraping {len(cat_product_urls)} products...")
                     
@@ -412,7 +476,7 @@ class MissedProductsScraper:
                             break
                         
                         try:
-                            product = await self.scrape_product(scraper_page, url)
+                            product = await self.scrape_product(scraper_page, url, category_name)
                             self.products.append(product)
                             
                             total = len(self.products)

@@ -81,8 +81,8 @@ class LaplatefFormeStableScraper:
         
         return f"{speed:.1f}/min", eta_str
     
-    async def scrape_product(self, page, product_url):
-        """Scrape single product - FAST"""
+    async def scrape_product(self, page, product_url, category_name=''):
+        """Scrape single product"""
         try:
             # Extract ID
             match = re.search(r'/catalogue/produit/(\d+)', product_url)
@@ -106,6 +106,22 @@ class LaplatefFormeStableScraper:
             for item in data_layer:
                 if isinstance(item, dict):
                     product_data.update(item)
+            
+            # Extract category from breadcrumbs if not provided
+            if not category_name:
+                try:
+                    breadcrumbs = await page.evaluate('''() => {
+                        const breadcrumbs = [];
+                        const items = document.querySelectorAll('.breadcrumb a, nav[aria-label*="breadcrumb"] a, ol.breadcrumb a');
+                        items.forEach(item => {
+                            if (item.textContent.trim()) breadcrumbs.push(item.textContent.trim());
+                        });
+                        return breadcrumbs;
+                    }''')
+                    if breadcrumbs and len(breadcrumbs) > 1:
+                        category_name = breadcrumbs[-1]  # Last breadcrumb is usually the category
+                except:
+                    pass
             
             # Format prices with comma as decimal separator for Excel
             
@@ -132,6 +148,9 @@ class LaplatefFormeStableScraper:
             else:
                 formatted_price_ht = ''
             
+            # Get category - prefer dataLayer, then breadcrumbs, then provided
+            category = product_data.get('product_category', '') or category_name or ''
+            
             # Build product
             product = {
                 'product_id': product_id,
@@ -141,7 +160,7 @@ class LaplatefFormeStableScraper:
                 'product_unitprice_ht': formatted_price_ht,
                 'brand': product_data.get('product_brand', ''),
                 'sku': product_data.get('product_sku', product_id),
-                'category': product_data.get('product_category', ''),
+                'category': category,
                 'pdf_url': f"https://www.laplateforme.com/catalogue/pdf/product/false/{product_id}",
                 'pdf_downloaded': 'no',
                 'status': 'success'
@@ -229,19 +248,38 @@ class LaplatefFormeStableScraper:
             self.log("Finding categories...")
             finder_page = await context.new_page()
             try:
-                await finder_page.goto('https://www.laplateforme.com/', wait_until='domcontentloaded', timeout=30000)
+                await finder_page.goto('https://www.laplateforme.com/', wait_until='networkidle', timeout=30000)
+                await asyncio.sleep(3)  # Wait for Angular.js to render
+                
+                # Scroll to load lazy content
+                await finder_page.evaluate('window.scrollTo(0, document.body.scrollHeight)')
+                await asyncio.sleep(1)
+                await finder_page.evaluate('window.scrollTo(0, 0)')
                 await asyncio.sleep(1)
                 
                 links = await finder_page.query_selector_all('a[href*="/catalogue/categorie/"]')
                 categories = []
                 for link in links:
                     href = await link.get_attribute('href')
-                    if href:
+                    if href and '/catalogue/categorie/' in href:
                         if not href.startswith('http'):
                             href = 'https://www.laplateforme.com' + href
                         categories.append(href)
                 
                 categories = list(set(categories))
+                if len(categories) == 0:
+                    self.log("⚠️ No categories found, trying alternative method...")
+                    # Try waiting more
+                    await asyncio.sleep(3)
+                    links = await finder_page.query_selector_all('a[href*="/catalogue/categorie/"]')
+                    for link in links:
+                        href = await link.get_attribute('href')
+                        if href and '/catalogue/categorie/' in href:
+                            if not href.startswith('http'):
+                                href = 'https://www.laplateforme.com' + href
+                            categories.append(href)
+                    categories = list(set(categories))
+                
                 self.log(f"Found {len(categories)} categories\n")
             finally:
                 await finder_page.close()
@@ -282,6 +320,7 @@ class LaplatefFormeStableScraper:
                             links = await product_finder.query_selector_all('a[href*="/catalogue/produit/"]')
                             new_products = 0
                             duplicates_on_page = 0
+                            seen_on_page = set()  # Track unique IDs found on this page
                             
                             for link in links:
                                 href = await link.get_attribute('href')
@@ -289,6 +328,12 @@ class LaplatefFormeStableScraper:
                                     match = re.search(r'/catalogue/produit/(\d+)', href)
                                     if match:
                                         product_id = match.group(1)
+                                        
+                                        # Skip if already processed on this page
+                                        if product_id in seen_on_page:
+                                            continue
+                                        seen_on_page.add(product_id)
+                                        
                                         if product_id not in self.product_ids:
                                             if not href.startswith('http'):
                                                 href = 'https://www.laplateforme.com' + href
@@ -300,8 +345,6 @@ class LaplatefFormeStableScraper:
                                             # Check if it's a cross-category duplicate (not just same-page link)
                                             first_cat_info = self.product_first_category.get(product_id, '')
                                             if first_cat_info and f"Cat {cat_i}:" not in first_cat_info:
-                                                # Log only cross-category duplicates
-                                                self.log(f"    ⚠️ DUP: [{product_id}] already from {first_cat_info}")
                                                 duplicates_on_page += 1
                                                 self.duplicates_in_category += 1
                             
@@ -341,6 +384,27 @@ class LaplatefFormeStableScraper:
                         self.log(f"  → Empty category, skipping\n")
                         continue
                     
+                    # Extract category name from URL
+                    category_name = ''
+                    try:
+                        # Extract category name from URL path
+                        # URL format: /catalogue/categorie/category-path/ID
+                        url_parts = [p for p in cat_url.split('/') if p]
+                        if 'categorie' in url_parts:
+                            cat_idx = url_parts.index('categorie')
+                            if cat_idx + 1 < len(url_parts):
+                                # Get all parts after 'categorie' before the ID (last numeric part)
+                                cat_parts = []
+                                for part in url_parts[cat_idx + 1:]:
+                                    if part.isdigit():
+                                        break
+                                    cat_parts.append(part)
+                                if cat_parts:
+                                    # Use last meaningful part or join if multiple
+                                    category_name = cat_parts[-1].replace('-', ' ').title()
+                    except:
+                        pass
+                    
                     # SCRAPE SEQUENTIALLY (one by one)
                     self.log(f"  Scraping {len(cat_product_urls)} products...")
                     
@@ -349,7 +413,7 @@ class LaplatefFormeStableScraper:
                             break
                         
                         try:
-                            product = await self.scrape_product(scraper_page, url)
+                            product = await self.scrape_product(scraper_page, url, category_name)
                             self.products.append(product)
                             
                             total = len(self.products)

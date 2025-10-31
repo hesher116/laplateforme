@@ -94,21 +94,7 @@ output/
 ## 📊 Output Format
 
 ### CSV (products.csv)
-Semicolon-delimited with comma as decimal separator (Excel-compatible):
-
-| Field | Description |
-|-------|-------------|
-| product_id | Unique product identifier |
-| name | Product name |
-| url | Product page URL |
-| price | Main price (€HT) |
-| product_unitprice_ht | Unit price (€HT) |
-| brand | Manufacturer brand |
-| sku | Stock keeping unit |
-| category | Product category |
-| pdf_url | Technical sheet URL |
-| pdf_downloaded | PDF download status (yes/no) |
-| status | Scraping status |
+Semicolon-delimited with comma as decimal separator (Excel-compatible)
 
 ### JSON (data/json/)
 Complete product data extracted from site's dataLayer, including all available metadata.

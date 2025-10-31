@@ -163,13 +163,18 @@ class LaplatefFormeStableScraper:
                 'category': category,
                 'pdf_url': f"https://www.laplateforme.com/catalogue/pdf/product/false/{product_id}",
                 'pdf_downloaded': 'no',
+                'JSON_downloaded': 'no',
                 'status': 'success'
             }
             
             # Save JSON
             json_file = self.data_dir / f"{product_id}.json"
-            async with aiofiles.open(json_file, 'w', encoding='utf-8') as f:
-                await f.write(json.dumps(product_data, ensure_ascii=False, indent=2))
+            try:
+                async with aiofiles.open(json_file, 'w', encoding='utf-8') as f:
+                    await f.write(json.dumps(product_data, ensure_ascii=False, indent=2))
+                product['JSON_downloaded'] = 'yes'
+            except Exception:
+                product['JSON_downloaded'] = 'no'
             
             # Download PDF
             pdf_path = self.pdf_dir / f"{product_id}.pdf"
